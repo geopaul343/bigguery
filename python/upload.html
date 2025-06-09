@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Audio File Upload</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .upload-container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #333;
+        }
+        input[type="file"] {
+            display: block;
+            margin-bottom: 10px;
+            width: 100%;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        .success {
+            background-color: #dff0d8;
+            color: #3c763d;
+        }
+        .error {
+            background-color: #f2dede;
+            color: #a94442;
+        }
+        .progress {
+            margin-top: 20px;
+            display: none;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background-color: #f0f0f0;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background-color: #4CAF50;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="upload-container">
+        <h1 style="text-align: center; color: #333; margin-bottom: 30px;">Audio File Upload</h1>
+        
+        <div class="form-group">
+            <label for="userId">Your User ID:</label>
+            <input type="text" id="userId" placeholder="Enter your user ID" required />
+        </div>
+
+        <div class="form-group">
+            <label for="file">Select Audio File:</label>
+            <input type="file" id="file" accept="audio/*" required />
+        </div>
+
+        <button onclick="uploadFile()" id="uploadButton">Upload Audio File</button>
+
+        <div class="progress">
+            <div class="progress-bar">
+                <div class="progress-bar-fill"></div>
+            </div>
+        </div>
+
+        <div id="status"></div>
+    </div>
+
+    <script>
+        async function uploadFile() {
+            const fileInput = document.getElementById('file');
+            const userIdInput = document.getElementById('userId');
+            const statusDiv = document.getElementById('status');
+            const uploadButton = document.getElementById('uploadButton');
+            const progressDiv = document.querySelector('.progress');
+            const progressBarFill = document.querySelector('.progress-bar-fill');
+            
+            // Validate inputs
+            if (!fileInput.files.length) {
+                showStatus('Please select an audio file', 'error');
+                return;
+            }
+            if (!userIdInput.value.trim()) {
+                showStatus('Please enter your user ID', 'error');
+                return;
+            }
+
+            const file = fileInput.files[0];
+            uploadButton.disabled = true;
+            progressDiv.style.display = 'block';
+            
+            try {
+                // Step 1: Get upload URL
+                showStatus('Getting upload URL...', '');
+                const urlResponse = await fetch('https://token-service-887192895309.us-central1.run.app/get-upload-url', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        file_name: file.name,
+                        content_type: file.type
+                    })
+                });
+
+                const urlData = await urlResponse.json();
+                if (!urlData.success) {
+                    throw new Error(urlData.error || 'Failed to get upload URL');
+                }
+
+                // Step 2: Upload the file
+                showStatus('Uploading file...', '');
+                progressBarFill.style.width = '50%';
+                
+                const uploadResponse = await fetch(urlData.upload_url, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': file.type
+                    },
+                    body: file
+                });
+
+                if (!uploadResponse.ok) {
+                    throw new Error('Failed to upload file');
+                }
+
+                progressBarFill.style.width = '75%';
+
+                // Step 3: Register the upload
+                showStatus('Registering upload...', '');
+                const registerResponse = await fetch('https://token-service-887192895309.us-central1.run.app/register-upload', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        file_name: file.name,
+                        file_size: file.size,
+                        file_type: file.type,
+                        user_id: userIdInput.value.trim()
+                    })
+                });
+
+                const registerData = await registerResponse.json();
+                if (!registerData.success) {
+                    throw new Error(registerData.error || 'Failed to register upload');
+                }
+
+                progressBarFill.style.width = '100%';
+                showStatus('File uploaded successfully!', 'success');
+                
+                // Clear the form
+                fileInput.value = '';
+                userIdInput.value = '';
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+                progressBarFill.style.width = '0%';
+            } finally {
+                uploadButton.disabled = false;
+                setTimeout(() => {
+                    progressDiv.style.display = 'none';
+                    progressBarFill.style.width = '0%';
+                }, 3000);
+            }
+        }
+
+        function showStatus(message, type) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.className = type;
+        }
+    </script>
+</body>
+</html> 
