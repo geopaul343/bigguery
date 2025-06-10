@@ -1,10 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
-import 'package:googleapis/storage/v1.dart' as storage;
-import 'package:googleapis/bigquery/v2.dart' as bigquery;
-import 'package:googleapis_auth/auth_io.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 import 'dart:io';
 import 'dart:convert';
 
@@ -15,15 +11,15 @@ void main() {
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'Healthcare Audio FHIR Uploader',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const MyHomePage(title: 'Healthcare Audio FHIR Upload'),
     );
   }
 }
@@ -38,242 +34,305 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  bool _isUploading = false;
-  bool _isPicking = false;
-  bool _isLoadingToBigQuery = false;
-  String? _uploadStatus;
-  File? _selectedFile;
-  String? _uploadedFileName;
+  final String backendUrl = 'https://data-api-887192895309.us-central1.run.app';
 
-  Future<void> _pickFile() async {
+  String _statusMessage = 'Ready to upload audio files with FHIR support';
+  File? _selectedFile;
+  String? _uploadUrl;
+  bool _isUploaded = false;
+
+  // FHIR-related fields
+  final TextEditingController _patientIdController = TextEditingController();
+  final TextEditingController _operatorNameController = TextEditingController();
+  final TextEditingController _reasonController = TextEditingController();
+  Map<String, dynamic>? _fhirBundle;
+
+  @override
+  void dispose() {
+    _patientIdController.dispose();
+    _operatorNameController.dispose();
+    _reasonController.dispose();
+    super.dispose();
+  }
+
+  // Test backend connection
+  Future<void> _testBackendConnection() async {
     try {
       setState(() {
-        _isPicking = true;
-        _uploadStatus = 'Picking file...';
+        _statusMessage = 'Testing backend connection...';
       });
 
-      // Pick audio file using file_picker
+      final response = await http.get(Uri.parse('$backendUrl/health'));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        setState(() {
+          _statusMessage =
+              '✅ Backend connected: ${data['status']} - Storage: ${data['storage']}';
+        });
+      } else {
+        setState(() {
+          _statusMessage =
+              '❌ Backend connection failed: ${response.statusCode}';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _statusMessage = '❌ Error connecting to backend: $e';
+      });
+    }
+  }
+
+  // Pick audio file
+  Future<void> _pickAudioFile() async {
+    try {
+      setState(() {
+        _statusMessage = 'Selecting audio file...';
+      });
+
       FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.audio,
+        type: FileType.custom,
+        allowedExtensions: ['mp3', 'wav', 'ogg', 'm4a'],
         allowMultiple: false,
       );
 
-      if (result == null) {
-        setState(() {
-          _uploadStatus = 'No file selected';
-        });
-        return;
-      }
-
-      setState(() {
+      if (result != null && result.files.single.path != null) {
         _selectedFile = File(result.files.single.path!);
-        _uploadStatus = 'File selected: ${result.files.single.name}';
-      });
+        setState(() {
+          _statusMessage =
+              '📁 File selected: ${result.files.single.name} (${result.files.single.size} bytes)';
+        });
+      } else {
+        setState(() {
+          _statusMessage = '❌ No file selected';
+        });
+      }
     } catch (e) {
       setState(() {
-        _uploadStatus = 'Error picking file: $e';
-      });
-    } finally {
-      setState(() {
-        _isPicking = false;
+        _statusMessage = '❌ Error selecting file: $e';
       });
     }
   }
 
-  Future<void> _uploadFile() async {
+  // Upload to Cloud Storage
+  Future<void> _uploadToCloudStorage() async {
     if (_selectedFile == null) {
       setState(() {
-        _uploadStatus = 'Please select a file first';
+        _statusMessage = '❌ Please select a file first';
       });
       return;
     }
 
     try {
       setState(() {
-        _isUploading = true;
-        _uploadStatus = 'Uploading file...';
+        _statusMessage = 'Getting upload URL...';
       });
 
-      final fileName = _selectedFile!.path.split('/').last;
-      final fileExtension = fileName.split('.').last.toLowerCase();
-
-      // Initialize Google Cloud Storage - Load credentials from assets
-      final String credentialsJson = await rootBundle.loadString(
-        'assets/service-account-key.json',
+      // Get upload URL
+      final uploadUrlResponse = await http.post(
+        Uri.parse('$backendUrl/get-upload-url'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'file_name': _selectedFile!.path.split('/').last,
+          'content_type': 'audio/mpeg', // Adjust based on file type
+        }),
       );
-      final credentials = ServiceAccountCredentials.fromJson(
-        jsonDecode(credentialsJson),
-      );
 
-      final client = await clientViaServiceAccount(credentials, [
-        storage.StorageApi.devstorageFullControlScope,
-        bigquery.BigqueryApi.bigqueryScope,
-      ]);
-
-      final storageApi = storage.StorageApi(client);
-
-      // Set content type for audio files
-      String contentType = 'audio/$fileExtension';
-      if (!['mp3', 'wav', 'ogg', 'm4a'].contains(fileExtension)) {
+      if (uploadUrlResponse.statusCode != 200) {
         setState(() {
-          _uploadStatus = 'Only audio files (mp3, wav, ogg, m4a) are supported';
-          _isUploading = false;
+          _statusMessage =
+              '❌ Failed to get upload URL: ${uploadUrlResponse.statusCode}';
         });
         return;
       }
 
-      final media = storage.Media(
-        _selectedFile!.openRead(),
-        await _selectedFile!.length(),
-        contentType: contentType,
-      );
-
-      await storageApi.objects.insert(
-        storage.Object(),
-        'healthcare_audio_analyzer_fhir',
-        uploadMedia: media,
-        name: fileName,
-      );
+      final uploadData = jsonDecode(uploadUrlResponse.body);
+      _uploadUrl = uploadData['upload_url'];
 
       setState(() {
-        _uploadStatus = 'File uploaded successfully!';
-        _uploadedFileName = fileName;
-        _selectedFile = null;
+        _statusMessage = 'Uploading file to Cloud Storage...';
       });
+
+      // Upload file directly to Cloud Storage
+      final uploadResponse = await http.put(
+        Uri.parse(_uploadUrl!),
+        headers: {'Content-Type': 'audio/mpeg'},
+        body: await _selectedFile!.readAsBytes(),
+      );
+
+      if (uploadResponse.statusCode == 200) {
+        setState(() {
+          _statusMessage = '✅ File uploaded successfully to Cloud Storage!';
+          _isUploaded = true;
+        });
+      } else {
+        setState(() {
+          _statusMessage = '❌ Upload failed: ${uploadResponse.statusCode}';
+        });
+      }
     } catch (e) {
       setState(() {
-        _uploadStatus = 'Error uploading file: $e';
-      });
-    } finally {
-      setState(() {
-        _isUploading = false;
+        _statusMessage = '❌ Error uploading file: $e';
       });
     }
   }
 
-  Future<void> _loadToBigQuery() async {
-    if (_uploadedFileName == null) {
+  // Register in BigQuery (Traditional)
+  Future<void> _registerInBigQuery() async {
+    if (_selectedFile == null || !_isUploaded) {
       setState(() {
-        _uploadStatus = 'Please upload a file first';
+        _statusMessage = '❌ Please upload a file first';
       });
       return;
     }
 
     try {
       setState(() {
-        _isLoadingToBigQuery = true;
-        _uploadStatus = 'Loading file to BigQuery...';
+        _statusMessage = 'Registering in BigQuery...';
       });
 
-      // Initialize BigQuery API
-      final String credentialsJson = await rootBundle.loadString(
-        'assets/service-account-key.json',
-      );
-      final credentialsMap = jsonDecode(credentialsJson);
-      final credentials = ServiceAccountCredentials.fromJson(credentialsMap);
-
-      final client = await clientViaServiceAccount(credentials, [
-        bigquery.BigqueryApi.bigqueryScope,
-      ]);
-
-      final bigQueryApi = bigquery.BigqueryApi(client);
-
-      // Get project ID from credentials
-      final projectId = credentialsMap['project_id'] as String;
-
-      // Create dataset if it doesn't exist
-      const datasetId = 'healthcare_audio_data';
-      try {
-        await bigQueryApi.datasets.get(projectId, datasetId);
-      } catch (e) {
-        // Dataset doesn't exist, create it
-        final dataset =
-            bigquery.Dataset()
-              ..datasetReference =
-                  (bigquery.DatasetReference()
-                    ..projectId = projectId
-                    ..datasetId = datasetId)
-              ..friendlyName = 'Healthcare Audio Data'
-              ..description = 'Dataset for healthcare audio files';
-
-        await bigQueryApi.datasets.insert(dataset, projectId);
-      }
-
-      // Create table if it doesn't exist
-      const tableId = 'audio_files';
-      try {
-        await bigQueryApi.tables.get(projectId, datasetId, tableId);
-      } catch (e) {
-        // Table doesn't exist, create it
-        final table =
-            bigquery.Table()
-              ..tableReference =
-                  (bigquery.TableReference()
-                    ..projectId = projectId
-                    ..datasetId = datasetId
-                    ..tableId = tableId)
-              ..friendlyName = 'Audio Files'
-              ..description = 'Table containing audio file metadata'
-              ..schema =
-                  (bigquery.TableSchema()
-                    ..fields = [
-                      bigquery.TableFieldSchema()
-                        ..name = 'file_name'
-                        ..type = 'STRING'
-                        ..mode = 'REQUIRED'
-                        ..description = 'Name of the audio file',
-                      bigquery.TableFieldSchema()
-                        ..name = 'file_path'
-                        ..type = 'STRING'
-                        ..mode = 'REQUIRED'
-                        ..description = 'Cloud Storage path of the file',
-                      bigquery.TableFieldSchema()
-                        ..name = 'upload_timestamp'
-                        ..type = 'TIMESTAMP'
-                        ..mode = 'REQUIRED'
-                        ..description = 'When the file was uploaded',
-                      bigquery.TableFieldSchema()
-                        ..name = 'file_size_bytes'
-                        ..type = 'INTEGER'
-                        ..mode = 'NULLABLE'
-                        ..description = 'Size of the file in bytes',
-                    ]);
-
-        await bigQueryApi.tables.insert(table, projectId, datasetId);
-      }
-
-      // Insert file metadata into BigQuery table
-      final row =
-          bigquery.TableDataInsertAllRequestRows()
-            ..json = {
-              'file_name': _uploadedFileName,
-              'file_path':
-                  'gs://healthcare_audio_analyzer_fhir/$_uploadedFileName',
-              'upload_timestamp': DateTime.now().toUtc().toIso8601String(),
-              'file_size_bytes': await _selectedFile?.length(),
-            };
-
-      final insertRequest = bigquery.TableDataInsertAllRequest()..rows = [row];
-
-      await bigQueryApi.tabledata.insertAll(
-        insertRequest,
-        projectId,
-        datasetId,
-        tableId,
+      final response = await http.post(
+        Uri.parse('$backendUrl/register-upload'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'file_name': _selectedFile!.path.split('/').last,
+          'file_size': await _selectedFile!.length(),
+          'file_type': 'audio/mpeg',
+        }),
       );
 
-      setState(() {
-        _uploadStatus =
-            'File metadata loaded to BigQuery successfully!\nDataset: $datasetId\nTable: $tableId';
-        _uploadedFileName = null;
-      });
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        setState(() {
+          _statusMessage = '✅ Registered in BigQuery successfully!';
+        });
+      } else {
+        setState(() {
+          _statusMessage =
+              '❌ BigQuery registration failed: ${response.statusCode}';
+        });
+      }
     } catch (e) {
       setState(() {
-        _uploadStatus = 'Error loading to BigQuery: $e';
+        _statusMessage = '❌ Error registering in BigQuery: $e';
       });
-    } finally {
+    }
+  }
+
+  // Register with FHIR resources
+  Future<void> _registerWithFHIR() async {
+    if (_selectedFile == null || !_isUploaded) {
       setState(() {
-        _isLoadingToBigQuery = false;
+        _statusMessage = '❌ Please upload a file first';
+      });
+      return;
+    }
+
+    try {
+      setState(() {
+        _statusMessage = 'Creating FHIR resources...';
+      });
+
+      final requestBody = {
+        'file_name': _selectedFile!.path.split('/').last,
+        'file_size': await _selectedFile!.length(),
+        'file_type': 'audio/mpeg',
+      };
+
+      // Add optional FHIR fields if provided
+      if (_patientIdController.text.isNotEmpty) {
+        requestBody['patient_id'] = _patientIdController.text;
+      }
+      if (_operatorNameController.text.isNotEmpty) {
+        requestBody['operator_name'] = _operatorNameController.text;
+      }
+      if (_reasonController.text.isNotEmpty) {
+        requestBody['reason'] = _reasonController.text;
+      }
+
+      final response = await http.post(
+        Uri.parse('$backendUrl/register-upload-fhir'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(requestBody),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        setState(() {
+          _statusMessage =
+              '✅ FHIR resources created! Bundle ID: ${data['fhir_bundle_id']}';
+          _fhirBundle = data;
+        });
+      } else {
+        setState(() {
+          _statusMessage = '❌ FHIR registration failed: ${response.statusCode}';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _statusMessage = '❌ Error creating FHIR resources: $e';
+      });
+    }
+  }
+
+  // View FHIR resources
+  Future<void> _viewFHIRResources() async {
+    if (_patientIdController.text.isEmpty) {
+      setState(() {
+        _statusMessage = '❌ Please enter a Patient ID to view FHIR resources';
+      });
+      return;
+    }
+
+    try {
+      setState(() {
+        _statusMessage = 'Fetching FHIR resources...';
+      });
+
+      final response = await http.get(
+        Uri.parse(
+          '$backendUrl/fhir/Media?patient=${_patientIdController.text}',
+        ),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        showDialog(
+          context: context,
+          builder: (BuildContext context) {
+            return AlertDialog(
+              title: Text('FHIR Media Resources'),
+              content: Container(
+                width: double.maxFinite,
+                height: 400,
+                child: SingleChildScrollView(
+                  child: Text(
+                    const JsonEncoder.withIndent('  ').convert(data),
+                    style: TextStyle(fontSize: 12, fontFamily: 'monospace'),
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: Text('Close'),
+                ),
+              ],
+            );
+          },
+        );
+        setState(() {
+          _statusMessage = '✅ FHIR resources loaded successfully';
+        });
+      } else {
+        setState(() {
+          _statusMessage =
+              '❌ Failed to fetch FHIR resources: ${response.statusCode}';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _statusMessage = '❌ Error fetching FHIR resources: $e';
       });
     }
   }
@@ -285,84 +344,219 @@ class _MyHomePageState extends State<MyHomePage> {
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: Text(widget.title),
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // First Button - Pick Audio File
-              ElevatedButton.icon(
-                onPressed: _isPicking ? null : _pickFile,
-                icon: const Icon(Icons.folder_open),
-                label: Text(_isPicking ? "Picking..." : "Pick Audio File"),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 15),
-                  backgroundColor: Colors.blue,
-                  foregroundColor: Colors.white,
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: <Widget>[
+            // Backend URL Display
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    Text(
+                      'Backend URL',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      backendUrl,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                        color: Colors.blue,
+                      ),
+                    ),
+                  ],
                 ),
               ),
+            ),
+            const SizedBox(height: 16),
 
-              const SizedBox(height: 20),
-
-              // Second Button - Upload to Cloud Storage
-              ElevatedButton.icon(
-                onPressed:
-                    (_isUploading || _selectedFile == null)
-                        ? null
-                        : _uploadFile,
-                icon: const Icon(Icons.cloud_upload),
-                label: Text(
-                  _isUploading ? "Uploading..." : "Upload to Cloud Storage",
-                ),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 15),
-                  backgroundColor: Colors.green,
-                  foregroundColor: Colors.white,
+            // FHIR Patient Information
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'FHIR Patient Information (Optional)',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _patientIdController,
+                      decoration: const InputDecoration(
+                        labelText: 'Patient ID',
+                        hintText: 'e.g., 12345',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _operatorNameController,
+                      decoration: const InputDecoration(
+                        labelText: 'Operator/Doctor Name',
+                        hintText: 'e.g., Dr. Smith',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _reasonController,
+                      decoration: const InputDecoration(
+                        labelText: 'Reason for Recording',
+                        hintText: 'e.g., Cardiac assessment',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ],
                 ),
               ),
+            ),
+            const SizedBox(height: 16),
 
-              const SizedBox(height: 20),
-
-              // Third Button - Load to BigQuery
-              ElevatedButton.icon(
-                onPressed:
-                    (_isLoadingToBigQuery || _uploadedFileName == null)
-                        ? null
-                        : _loadToBigQuery,
-                icon: const Icon(Icons.analytics),
-                label: Text(
-                  _isLoadingToBigQuery
-                      ? "Loading to BigQuery..."
-                      : "Load to BigQuery",
+            // Action Buttons
+            Column(
+              children: [
+                // Test Backend Connection
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _testBackendConnection,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.purple,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.all(16),
+                    ),
+                    child: const Text('💜 Test Backend Connection'),
+                  ),
                 ),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 15),
-                  backgroundColor: Colors.orange,
-                  foregroundColor: Colors.white,
+                const SizedBox(height: 12),
+
+                // Pick Audio File
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _pickAudioFile,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.all(16),
+                    ),
+                    child: const Text('🔵 Pick Audio File'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // Upload to Cloud Storage
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _uploadToCloudStorage,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.all(16),
+                    ),
+                    child: const Text('🟢 Upload to Cloud Storage'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // Register in BigQuery (Traditional)
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _registerInBigQuery,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.orange,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.all(16),
+                    ),
+                    child: const Text('🟠 Register in BigQuery'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // Register with FHIR
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _registerWithFHIR,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.all(16),
+                    ),
+                    child: const Text('🔴 Create FHIR Resources'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // View FHIR Resources
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: _viewFHIRResources,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.teal,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.all(16),
+                    ),
+                    child: const Text('🔍 View FHIR Resources'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 24),
+
+            // Status Message
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    Text(
+                      'Status',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      _statusMessage,
+                      style: const TextStyle(fontSize: 14),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
                 ),
               ),
+            ),
 
-              const SizedBox(height: 30),
-
-              // Status Message
-              if (_uploadStatus != null)
-                Container(
+            // FHIR Bundle Information (if available)
+            if (_fhirBundle != null) ...[
+              const SizedBox(height: 16),
+              Card(
+                child: Padding(
                   padding: const EdgeInsets.all(16.0),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[100],
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.grey[300]!),
-                  ),
-                  child: Text(
-                    _uploadStatus!,
-                    style: const TextStyle(fontSize: 16),
-                    textAlign: TextAlign.center,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Latest FHIR Bundle',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      Text('Bundle ID: ${_fhirBundle!['fhir_bundle_id']}'),
+                      Text(
+                        'Resources Created: ${_fhirBundle!['fhir_resources_created']}',
+                      ),
+                    ],
                   ),
                 ),
+              ),
             ],
-          ),
+          ],
         ),
       ),
     );

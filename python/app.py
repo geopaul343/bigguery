@@ -21,9 +21,6 @@ app = Flask(__name__)
 # Initialize the connector
 connector = Connector()
 
-# Initialize StorageHandler
-storage_handler = StorageHandler()
-
 # Initialize Google Cloud clients with credentials
 credentials, project_id = generate_token()
 if not credentials or not project_id:
@@ -31,6 +28,9 @@ if not credentials or not project_id:
 
 storage_client = storage.Client(credentials=credentials, project=project_id)
 bigquery_client = bigquery.Client(credentials=credentials, project=project_id)
+
+# Initialize StorageHandler with credentials
+storage_handler = StorageHandler(credentials=credentials)
 
 # Constants
 BUCKET_NAME = 'healthcare_audio_analyzer_fhir'
@@ -485,6 +485,163 @@ def serve_upload_page():
 def upload_page():
     """Alternative route to serve the upload page"""
     return serve_upload_page()
+
+@app.route('/register-upload-fhir', methods=['POST'])
+def register_upload_fhir():
+    """Register a successful file upload with FHIR resource creation"""
+    try:
+        data = request.get_json()
+        required_fields = ['file_name', 'file_size', 'file_type']
+        
+        # Check for required fields
+        for field in required_fields:
+            if field not in data:
+                return jsonify({
+                    'success': False,
+                    'error': f'Missing required field: {field}'
+                }), 400
+
+        # Generate a read URL for the file
+        read_url = storage_handler.get_signed_url(data['file_name'])
+        
+        # Store the metadata with FHIR resources
+        result = storage_handler.store_audio_file_with_fhir(
+            file_name=data['file_name'],
+            file_data=read_url,
+            file_size=data['file_size'],
+            file_type=data['file_type'],
+            patient_id=data.get('patient_id'),
+            operator_name=data.get('operator_name'),
+            duration_seconds=data.get('duration_seconds'),
+            reason=data.get('reason')
+        )
+
+        return jsonify({
+            'success': True,
+            'message': 'Upload registered with FHIR resources successfully',
+            'read_url': read_url,
+            'fhir_bundle_id': result['fhir_bundle']['id'],
+            'fhir_resources_created': len(result['fhir_bundle']['entry'])
+        })
+        
+    except Exception as e:
+        logger.error(f"Error registering upload with FHIR: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/fhir/Media', methods=['GET'])
+def get_fhir_media_resources():
+    """Retrieve FHIR Media resources"""
+    try:
+        patient_id = request.args.get('patient')
+        file_name = request.args.get('file_name')
+        
+        resources = storage_handler.get_fhir_resources(
+            patient_id=patient_id,
+            resource_type='Media',
+            file_name=file_name
+        )
+        
+        return jsonify({
+            'resourceType': 'Bundle',
+            'type': 'searchset',
+            'total': len(resources),
+            'entry': [{'resource': res['fhir_resource']} for res in resources if res['fhir_resource']]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving FHIR Media resources: {str(e)}")
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+@app.route('/fhir/DocumentReference', methods=['GET'])
+def get_fhir_document_references():
+    """Retrieve FHIR DocumentReference resources"""
+    try:
+        patient_id = request.args.get('patient')
+        file_name = request.args.get('file_name')
+        
+        resources = storage_handler.get_fhir_resources(
+            patient_id=patient_id,
+            resource_type='DocumentReference',
+            file_name=file_name
+        )
+        
+        return jsonify({
+            'resourceType': 'Bundle',
+            'type': 'searchset',
+            'total': len(resources),
+            'entry': [{'resource': res['fhir_resource']} for res in resources if res['fhir_resource']]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving FHIR DocumentReference resources: {str(e)}")
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+@app.route('/fhir/Bundle', methods=['GET'])
+def get_fhir_bundles():
+    """Retrieve FHIR Bundle resources"""
+    try:
+        patient_id = request.args.get('patient')
+        file_name = request.args.get('file_name')
+        
+        resources = storage_handler.get_fhir_resources(
+            patient_id=patient_id,
+            resource_type='Bundle',
+            file_name=file_name
+        )
+        
+        return jsonify({
+            'resourceType': 'Bundle',
+            'type': 'searchset',
+            'total': len(resources),
+            'entry': [{'resource': res['fhir_resource']} for res in resources if res['fhir_resource']]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving FHIR Bundle resources: {str(e)}")
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+@app.route('/fhir/Media/<resource_id>', methods=['GET'])
+def get_fhir_media_by_id(resource_id):
+    """Retrieve a specific FHIR Media resource by ID"""
+    try:
+        query = f"""
+        SELECT fhir_resource
+        FROM `{storage_handler.dataset_id}.{storage_handler.fhir_table_id}`
+        WHERE resource_type = 'Media' AND resource_id = @resource_id
+        LIMIT 1
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("resource_id", "STRING", resource_id)
+            ]
+        )
+        
+        query_job = storage_handler.bigquery_client.query(query, job_config=job_config)
+        results = list(query_job.result())
+        
+        if not results:
+            return jsonify({
+                'error': 'Resource not found'
+            }), 404
+        
+        fhir_resource = json.loads(results[0].fhir_resource)
+        return jsonify(fhir_resource)
+        
+    except Exception as e:
+        logger.error(f"Error retrieving FHIR Media resource by ID: {str(e)}")
+        return jsonify({
+            'error': str(e)
+        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))

@@ -1,21 +1,55 @@
 from google.cloud import storage, bigquery
 import logging
 import json
+import os
+import base64
 from datetime import datetime
+from google.oauth2 import service_account
+from fhir_converter import FHIRConverter
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 class StorageHandler:
-    def __init__(self, bucket_name="healthcare_audio_analyzer_fhir"):
+    def __init__(self, bucket_name="healthcare_audio_analyzer_fhir", credentials=None):
         self.bucket_name = bucket_name
-        self.storage_client = storage.Client()
-        self.bigquery_client = bigquery.Client()
+        
+        # Initialize credentials
+        if credentials:
+            self.credentials = credentials
+        else:
+            # Try to get credentials from environment variable
+            service_account_key_base64 = os.environ.get('SERVICE_ACCOUNT_KEY')
+            if service_account_key_base64:
+                try:
+                    # Decode base64 service account key
+                    service_account_key = base64.b64decode(service_account_key_base64).decode('utf-8')
+                    service_account_info = json.loads(service_account_key)
+                    self.credentials = service_account.Credentials.from_service_account_info(service_account_info)
+                    logger.info("Successfully loaded credentials from environment variable")
+                except Exception as e:
+                    logger.error(f"Error loading credentials from environment: {str(e)}")
+                    self.credentials = None
+            else:
+                logger.warning("No SERVICE_ACCOUNT_KEY environment variable found, using default credentials")
+                self.credentials = None
+        
+        # Initialize clients with credentials
+        if self.credentials:
+            self.storage_client = storage.Client(credentials=self.credentials)
+            self.bigquery_client = bigquery.Client(credentials=self.credentials)
+        else:
+            self.storage_client = storage.Client()
+            self.bigquery_client = bigquery.Client()
         
         # Use existing dataset and table
-        self.dataset_id = "app-audio-analyzer"
+        self.dataset_id = "healthcare_audio_data"
         self.table_id = "audio_files"
+        self.fhir_table_id = "fhir_resources"
+        
+        # Initialize FHIR converter
+        self.fhir_converter = FHIRConverter()
 
     def generate_upload_url(self, file_name, content_type="audio/wav", expiration=3600):
         """Generate a signed URL for uploading a file to GCS"""
@@ -39,16 +73,12 @@ class StorageHandler:
     def store_audio_file_metadata(self, file_name, file_data, file_size, file_type, user_id=None, analysis_status="pending"):
         """Store audio file metadata in BigQuery using the existing schema"""
         try:
-            # Prepare the row data
+            # Prepare the row data to match the existing table schema
             row_data = {
                 "file_name": file_name,
-                "file_data": file_data,  # This could be the file URL or file content reference
-                "file_size": file_size,
-                "file_type": file_type,
-                "user_id": user_id,
-                "upload_date": datetime.now().isoformat(),
-                "analysis_status": analysis_status,
-                "analysis_result": None  # Initially null, to be updated after analysis
+                "file_path": file_data,  # Store as file_path (URL or GCS path)
+                "upload_timestamp": datetime.now().isoformat(),
+                "file_size_bytes": file_size  # Store as file_size_bytes
             }
 
             # Insert the row into BigQuery
@@ -67,6 +97,134 @@ class StorageHandler:
 
         except Exception as e:
             logger.error(f"Error storing file metadata: {str(e)}")
+            raise
+
+    def store_fhir_resource(self, fhir_resource, patient_id=None, file_name=None):
+        """Store FHIR resource in BigQuery"""
+        try:
+            # Prepare the row data for FHIR resources table
+            row_data = {
+                "resource_type": fhir_resource.get("resourceType"),
+                "resource_id": fhir_resource.get("id"),
+                "fhir_resource": json.dumps(fhir_resource),
+                "created_at": datetime.now().isoformat(),
+                "patient_id": patient_id,
+                "file_name": file_name
+            }
+
+            # Insert the row into BigQuery FHIR table
+            table_ref = f"{self.dataset_id}.{self.fhir_table_id}"
+            errors = self.bigquery_client.insert_rows_json(
+                table_ref,
+                [row_data]
+            )
+
+            if errors:
+                logger.error(f"Errors inserting FHIR resource into BigQuery: {errors}")
+                raise Exception(f"Failed to insert FHIR resource into BigQuery: {errors}")
+
+            logger.info(f"Successfully stored FHIR resource: {fhir_resource.get('resourceType')}/{fhir_resource.get('id')}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error storing FHIR resource: {str(e)}")
+            raise
+
+    def store_audio_file_with_fhir(
+        self, 
+        file_name, 
+        file_data, 
+        file_size, 
+        file_type, 
+        patient_id=None, 
+        operator_name=None,
+        duration_seconds=None,
+        reason=None
+    ):
+        """Store audio file metadata and create FHIR resources"""
+        try:
+            # Store traditional metadata
+            self.store_audio_file_metadata(file_name, file_data, file_size, file_type)
+            
+            # Create FHIR bundle
+            fhir_bundle = self.fhir_converter.convert_audio_metadata_to_fhir(
+                file_name=file_name,
+                file_path=file_data,
+                file_size_bytes=file_size,
+                content_type=file_type,
+                patient_id=patient_id,
+                operator_name=operator_name,
+                duration_seconds=duration_seconds,
+                reason=reason
+            )
+            
+            # Store FHIR Bundle
+            self.store_fhir_resource(fhir_bundle, patient_id, file_name)
+            
+            # Store individual resources from the bundle
+            for entry in fhir_bundle.get("entry", []):
+                resource = entry.get("resource")
+                if resource:
+                    self.store_fhir_resource(resource, patient_id, file_name)
+            
+            logger.info(f"Successfully stored audio file with FHIR resources: {file_name}")
+            return {
+                "success": True,
+                "fhir_bundle": fhir_bundle,
+                "message": "Audio file and FHIR resources stored successfully"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error storing audio file with FHIR: {str(e)}")
+            raise
+
+    def get_fhir_resources(self, patient_id=None, resource_type=None, file_name=None):
+        """Retrieve FHIR resources from BigQuery"""
+        try:
+            # Build query based on filters
+            where_conditions = []
+            query_parameters = []
+            
+            if patient_id:
+                where_conditions.append("patient_id = @patient_id")
+                query_parameters.append(bigquery.ScalarQueryParameter("patient_id", "STRING", patient_id))
+            
+            if resource_type:
+                where_conditions.append("resource_type = @resource_type")
+                query_parameters.append(bigquery.ScalarQueryParameter("resource_type", "STRING", resource_type))
+            
+            if file_name:
+                where_conditions.append("file_name = @file_name")
+                query_parameters.append(bigquery.ScalarQueryParameter("file_name", "STRING", file_name))
+            
+            where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+            
+            query = f"""
+            SELECT resource_type, resource_id, fhir_resource, created_at, patient_id, file_name
+            FROM `{self.dataset_id}.{self.fhir_table_id}`
+            {where_clause}
+            ORDER BY created_at DESC
+            """
+            
+            job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
+            query_job = self.bigquery_client.query(query, job_config=job_config)
+            results = query_job.result()
+            
+            fhir_resources = []
+            for row in results:
+                fhir_resources.append({
+                    "resource_type": row.resource_type,
+                    "resource_id": row.resource_id,
+                    "fhir_resource": json.loads(row.fhir_resource) if row.fhir_resource else None,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "patient_id": row.patient_id,
+                    "file_name": row.file_name
+                })
+            
+            return fhir_resources
+            
+        except Exception as e:
+            logger.error(f"Error retrieving FHIR resources: {str(e)}")
             raise
 
     def update_analysis_status(self, file_name, status, result=None):
