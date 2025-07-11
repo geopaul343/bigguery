@@ -115,10 +115,6 @@ gsutil mb -p app-audio-analyzer gs://healthcare_audio_analyzer_fhir
 
 # Set bucket permissions (make it publicly readable if needed)
 gsutil iam ch allUsers:objectViewer gs://healthcare_audio_analyzer_fhir
-
-# Create BigQuery dataset
-bq mk --dataset --description "Healthcare audio data storage" app-audio-analyzer:healthcare_audio_data
-
 # Create BigQuery table
 bq mk --table app-audio-analyzer:healthcare_audio_data.audio_files \
   id:STRING,user_id:STRING,original_filename:STRING,file_path:STRING,file_size:INTEGER,upload_timestamp:TIMESTAMP,file_url:STRING
@@ -905,14 +901,6 @@ flutter test integration_test/
 ### 4. BigQuery Permission Denied
 **Solution**: Verify service account has BigQuery Admin role and proper dataset permissions.
 
-## 🔄 Future Enhancements
-
-1. **User Authentication**: Implement Firebase Auth or OAuth
-2. **File Processing**: Add audio transcription/analysis
-3. **Real-time Updates**: WebSocket connection for live status
-4. **Batch Operations**: Multiple file upload support
-5. **Analytics Dashboard**: Usage statistics and reporting
-
 ## 🤝 Contributing
 
 1. Fork the repository
@@ -920,14 +908,6 @@ flutter test integration_test/
 3. Commit changes (`git commit -am 'Add new feature'`)
 4. Push to branch (`git push origin feature/new-feature`)
 5. Create Pull Request
-
-## 📞 Support
-
-For issues and questions:
-1. Check existing GitHub issues
-2. Create new issue with detailed description
-3. Include logs and error messages
-4. Specify environment details (OS, Flutter version, etc.)
 
 ## 📄 License
 

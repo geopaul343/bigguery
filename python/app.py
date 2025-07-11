@@ -11,12 +11,21 @@ from storage_handler import StorageHandler
 from google.cloud import storage
 from google.cloud import bigquery
 
+# Import security services
+from kms_manager import KMSManager
+from audit_logger import AuditLogger
+from dlp_manager import DLPManager
+from security_middleware import SecurityMiddleware
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Create Flask app
 app = Flask(__name__)
+
+# Initialize security middleware
+security = SecurityMiddleware(app)
 
 # Initialize the connector
 connector = Connector()
@@ -32,9 +41,21 @@ bigquery_client = bigquery.Client(credentials=credentials, project=project_id)
 # Initialize StorageHandler with credentials
 storage_handler = StorageHandler(credentials=credentials)
 
+# Initialize security services
+kms_manager = KMSManager(project_id)
+audit_logger = AuditLogger(project_id)
+dlp_manager = DLPManager(project_id)
+
+# Configure KMS encryption for storage bucket
+try:
+    kms_manager.setup_storage_encryption(BUCKET_NAME)
+    logger.info("KMS encryption configured for storage bucket")
+except Exception as e:
+    logger.warning(f"Could not configure KMS encryption: {e}")
+
 # Constants
 BUCKET_NAME = 'healthcare_audio_analyzer_fhir'
-DATASET_ID = 'app-audio-analyzer'
+DATASET_ID = 'healthcare_audio_data'
 TABLE_ID = 'audio_records'
 
 # Function to get database connection
@@ -496,24 +517,73 @@ def register_upload_fhir():
         # Check for required fields
         for field in required_fields:
             if field not in data:
+                audit_logger.log_data_access(
+                    event_type="DATA_ACCESS",
+                    user_id=data.get('operator_name', 'unknown'),
+                    resource_type="FHIR_REGISTRATION",
+                    resource_id=data.get('file_name', 'unknown'),
+                    action="CREATE",
+                    patient_id=data.get('patient_id'),
+                    success=False,
+                    error_message=f'Missing required field: {field}'
+                )
                 return jsonify({
                     'success': False,
                     'error': f'Missing required field: {field}'
                 }), 400
+        
+        # Scan for PHI in the request data
+        request_text = json.dumps(data)
+        phi_scan = dlp_manager.scan_text_for_phi(request_text)
+        
+        # Log PHI detection
+        if phi_scan['has_phi']:
+            audit_logger.log_data_access(
+                event_type="PHI_DETECTION",
+                user_id=data.get('operator_name', 'unknown'),
+                resource_type="REQUEST_DATA",
+                resource_id=data['file_name'],
+                action="SCAN",
+                patient_id=data.get('patient_id'),
+                additional_context={
+                    'phi_findings': phi_scan['findings_count'],
+                    'risk_level': phi_scan['risk_level']
+                }
+            )
+        
+        # Encrypt sensitive data if present
+        encrypted_data = data.copy()
+        if data.get('patient_id'):
+            encrypted_data['patient_id_encrypted'] = kms_manager.encrypt_sensitive_data(data['patient_id'])
+            # Replace the original patient_id with encrypted version
+            encrypted_data['patient_id'] = encrypted_data['patient_id_encrypted']
+        if data.get('operator_name'):
+            encrypted_data['operator_name_encrypted'] = kms_manager.encrypt_sensitive_data(data['operator_name'])
+            # Replace the original operator_name with encrypted version
+            encrypted_data['operator_name'] = encrypted_data['operator_name_encrypted']
 
         # Generate a read URL for the file
         read_url = storage_handler.get_signed_url(data['file_name'])
         
-        # Store the metadata with FHIR resources
+        # Store the metadata with FHIR resources using encrypted data
         result = storage_handler.store_audio_file_with_fhir(
             file_name=data['file_name'],
             file_data=read_url,
             file_size=data['file_size'],
             file_type=data['file_type'],
-            patient_id=data.get('patient_id'),
-            operator_name=data.get('operator_name'),
+            patient_id=encrypted_data.get('patient_id'),  # Use encrypted version
+            operator_name=encrypted_data.get('operator_name'),  # Use encrypted version
             duration_seconds=data.get('duration_seconds'),
             reason=data.get('reason')
+        )
+        
+        # Log successful FHIR resource creation (use original unencrypted values for audit)
+        audit_logger.log_fhir_access(
+            user_id=data.get('operator_name', 'system'),
+            fhir_resource_type="Bundle",
+            fhir_resource_id=result['fhir_bundle']['id'],
+            operation="CREATE",
+            patient_id=data.get('patient_id')  # Original patient_id for audit trail
         )
 
         return jsonify({
@@ -521,14 +591,174 @@ def register_upload_fhir():
             'message': 'Upload registered with FHIR resources successfully',
             'read_url': read_url,
             'fhir_bundle_id': result['fhir_bundle']['id'],
-            'fhir_resources_created': len(result['fhir_bundle']['entry'])
+            'fhir_resources_created': len(result['fhir_bundle']['entry']),
+            'security_scan': {
+                'phi_detected': phi_scan['has_phi'],
+                'risk_level': phi_scan['risk_level']
+            }
         })
         
     except Exception as e:
+        # Log error with audit trail
+        audit_logger.log_data_access(
+            event_type="ERROR",
+            user_id=data.get('operator_name', 'unknown') if 'data' in locals() else 'unknown',
+            resource_type="FHIR_REGISTRATION",
+            resource_id=data.get('file_name', 'unknown') if 'data' in locals() else 'unknown',
+            action="CREATE",
+            patient_id=data.get('patient_id') if 'data' in locals() else None,
+            success=False,
+            error_message=str(e)
+        )
         logger.error(f"Error registering upload with FHIR: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
+        }), 500
+
+@app.route('/get-medical-records', methods=['GET'])
+def get_medical_records():
+    """Retrieve and decrypt medical records for display in Flutter app"""
+    try:
+        # Query BigQuery for encrypted medical records
+        query = """
+        SELECT 
+            file_name,
+            patient_id,
+            resource_id,
+            created_at,
+            fhir_resource
+        FROM `app-audio-analyzer.healthcare_audio_data.fhir_resources`
+        WHERE patient_id IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 20
+        """
+        
+        query_job = bigquery_client.query(query)
+        results = query_job.result()
+        
+        decrypted_records = []
+        
+        for row in results:
+            try:
+                # Decrypt patient ID
+                decrypted_patient_id = "Unknown Patient"
+                if row.patient_id and len(row.patient_id) > 50:  # Encrypted data
+                    try:
+                        decrypted_patient_id = kms_manager.decrypt_sensitive_data(row.patient_id)
+                    except Exception:
+                        decrypted_patient_id = "Decryption Failed"
+                else:
+                    decrypted_patient_id = row.patient_id or "Unknown Patient"
+                
+                # Parse FHIR resource to extract operator name and reason
+                doctor_name = "Unknown Doctor"
+                reason = "Not specified"
+                
+                if row.fhir_resource:
+                    try:
+                        fhir_data = json.loads(row.fhir_resource)
+                        
+                        # Extract data from FHIR bundle
+                        if 'entry' in fhir_data:
+                            for entry in fhir_data['entry']:
+                                resource = entry.get('resource', {})
+                                
+                                # Look for Practitioner (doctor) information
+                                if resource.get('resourceType') == 'Practitioner':
+                                    if 'name' in resource and len(resource['name']) > 0:
+                                        name_parts = resource['name'][0]
+                                        given_names = name_parts.get('given', [])
+                                        family_name = name_parts.get('family', '')
+                                        
+                                        if given_names or family_name:
+                                            full_name = f"{' '.join(given_names)} {family_name}".strip()
+                                            
+                                            # If the name looks encrypted (long base64), decrypt it
+                                            if len(full_name) > 50:  # Likely encrypted
+                                                try:
+                                                    doctor_name = kms_manager.decrypt_sensitive_data(full_name)
+                                                except Exception:
+                                                    doctor_name = "Decryption Failed"
+                                            else:
+                                                doctor_name = full_name
+                                
+                                # Look for DiagnosticReport (reason)
+                                elif resource.get('resourceType') == 'DiagnosticReport':
+                                    if 'code' in resource and 'text' in resource['code']:
+                                        reason = resource['code']['text']
+                                    elif 'conclusion' in resource:
+                                        reason = resource['conclusion']
+                                
+                                # Look for Media resource for additional info
+                                elif resource.get('resourceType') == 'Media':
+                                    if 'reasonCode' in resource and len(resource['reasonCode']) > 0:
+                                        if 'text' in resource['reasonCode'][0]:
+                                            reason = resource['reasonCode'][0]['text']
+                    
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse FHIR resource for {row.resource_id}")
+                
+                record = {
+                    'id': row.resource_id,
+                    'file_name': row.file_name,
+                    'patient_id': decrypted_patient_id,
+                    'doctor': doctor_name,
+                    'reason': reason,
+                    'date': row.created_at.isoformat() if row.created_at else None,
+                    'is_encrypted': len(row.patient_id or '') > 50  # Show if data was encrypted
+                }
+                
+                decrypted_records.append(record)
+                
+            except Exception as decrypt_error:
+                logger.warning(f"Failed to process record {row.resource_id}: {decrypt_error}")
+                # Include record with error indication
+                decrypted_records.append({
+                    'id': row.resource_id or 'unknown',
+                    'file_name': row.file_name or 'unknown',
+                    'patient_id': "Processing Error",
+                    'doctor': "Unknown",
+                    'reason': "Data Error",
+                    'date': row.created_at.isoformat() if row.created_at else None,
+                    'error': True
+                })
+        
+        # Log the access for audit trail
+        audit_logger.log_data_access(
+            event_type="DATA_ACCESS",
+            user_id="flutter_app",
+            resource_type="MEDICAL_RECORDS",
+            resource_id="bulk_query",
+            action="READ",
+            additional_context={
+                'records_count': len(decrypted_records),
+                'query_type': 'medical_records_display'
+            }
+        )
+        
+        return jsonify({
+            'success': True,
+            'records': decrypted_records,
+            'total_count': len(decrypted_records),
+            'message': f'Retrieved {len(decrypted_records)} medical records'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error retrieving medical records: {str(e)}")
+        audit_logger.log_data_access(
+            event_type="DATA_ACCESS",
+            user_id="flutter_app",
+            resource_type="MEDICAL_RECORDS",
+            resource_id="bulk_query",
+            action="READ",
+            success=False,
+            error_message=str(e)
+        )
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to retrieve medical records'
         }), 500
 
 @app.route('/fhir/Media', methods=['GET'])

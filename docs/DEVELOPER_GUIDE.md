@@ -31,53 +31,7 @@ This guide helps developers understand the codebase structure, development workf
 ```
 lib/
 └── main.dart                 # Single file containing entire app
-    ├── AudioUploadApp        # Main app widget
-    ├── AudioUploadState      # App state management
-    └── ApiService           # Backend API integration
-```
-
-### Key Classes
-
-#### 1. AudioUploadApp
-```dart
-class AudioUploadApp extends StatefulWidget {
-  @override
-  _AudioUploadState createState() => _AudioUploadState();
-}
-```
-- Main application widget
-- Sets up Material app theme
-- Manages app-wide state
-
-#### 2. AudioUploadState
-```dart
-class _AudioUploadState extends State<AudioUploadApp> {
-  // State variables
-  PlatformFile? selectedFile;
-  String statusMessage = 'No action taken';
-  bool isLoading = false;
-  String? uploadUrl;
-  String? filePath;
-}
-```
-
-**Key State Variables:**
-- `selectedFile`: Currently selected audio file
-- `statusMessage`: User feedback message
-- `isLoading`: Loading state for UI
-- `uploadUrl`: Signed URL for Cloud Storage
-- `filePath`: File path in storage bucket
-
-#### 3. ApiService
-```dart
-class ApiService {
-  static const String baseUrl = 'https://data-api-887192895309.us-central1.run.app';
   
-  static Future<bool> testConnection() async { ... }
-  static Future<Map<String, dynamic>> generateUploadUrl(...) async { ... }
-  static Future<Map<String, dynamic>> registerFile(...) async { ... }
-  static Future<bool> uploadFileToStorage(...) async { ... }
-}
 ```
 
 ### User Interface Components
@@ -113,10 +67,8 @@ flutter run            # For mobile
 ```bash
 # Enable hot reload for rapid development
 flutter run --hot
-
 # Hot restart if needed
 r
-
 # Quit
 q
 ```
